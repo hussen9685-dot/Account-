@@ -698,6 +698,7 @@ canvas{max-width:100%;}
           <option value="หุ้น">หุ้น</option>
           <option value="ทองคำ">ทองคำ</option>
           <option value="กองทุน">กองทุนรวม</option>
+          <option value="เงินออม">เงินออม (บัญชีเงินฝาก)</option>
           <option value="อื่นๆ">อื่นๆ</option>
         </select>
       </div>
@@ -728,7 +729,7 @@ canvas{max-width:100%;}
         <input type="number" id="asCurrentPrice" class="mono">
         <button class="btn btn-outline" id="asFetchPrice" type="button" style="margin-top:8px;padding:9px;font-size:13px;display:none;">ดึงราคาล่าสุด</button>
       </div>
-      <div class="banner warn" style="margin-top:-4px;"><b>หมายเหตุ:</b> ดึงราคาอัตโนมัติได้เฉพาะคริปโตและทองคำ (ผ่าน API สาธารณะ อาจคลาดเคลื่อน/ล่มได้บ้าง) หุ้นต้องอัปเดตเอง</div>
+      <div class="banner warn" style="margin-top:-4px;"><b>หมายเหตุ:</b> ดึงราคาอัตโนมัติได้เฉพาะคริปโตและทองคำ (รีเฟรชเองตอนเปิดแอปและทุก 10 วินาที) หุ้นต้องอัปเดตเอง — สำหรับ "เงินออม" ให้ใส่จำนวนหน่วย = 1 และราคาต่อหน่วย = ยอดเงินฝากปัจจุบัน แล้วแก้ไขยอดเองเมื่อฝาก/ถอน/ได้ดอกเบี้ย</div>
     </div>
 
     <div class="field"><label>สถานะ</label>
@@ -912,8 +913,8 @@ function attemptLogin(){
   if(selectedLoginUser.pin === pendingPin){
     currentUser = selectedLoginUser;
     if(currentUser.id==='__default__'){
-      // create the default admin user in firestore on first login
-      db.collection('users').add({name:'ผู้ดูแล', pin:'0000', createdAt: Date.now()});
+      // create the default admin user in firestore on first login (fixed id = idempotent, no duplicates)
+      db.collection('users').doc('default_admin').set({name:'ผู้ดูแล', pin:'0000', createdAt: Date.now()}, {merge:true});
     }
     document.getElementById('loginScreen').style.display='none';
     document.getElementById('mainApp').style.display='flex';
@@ -951,6 +952,7 @@ function initAppData(){
     assets = snap.docs.map(d=>({id:d.id,...d.data()}));
     renderAssets(); renderReports();
   });
+  startLivePriceAutoRefresh();
   db.collection('closings').onSnapshot(snap=>{
     closings = {};
     snap.docs.forEach(d=> closings[d.id] = {id:d.id,...d.data()});
@@ -1490,6 +1492,43 @@ document.getElementById('asFetchPrice').addEventListener('click', async ()=>{
   }
   btn.disabled = false; btn.textContent = 'ดึงราคาล่าสุด';
 });
+
+let livePriceIntervalId = null;
+function startLivePriceAutoRefresh(){
+  refreshAllLivePrices();
+  if(livePriceIntervalId) clearInterval(livePriceIntervalId);
+  livePriceIntervalId = setInterval(refreshAllLivePrices, 10*1000);
+}
+async function refreshAllLivePrices(){
+  const live = assets.filter(a => a.assetType==='investment' && a.status==='active' && (a.category==='คริปโต' || a.category==='ทองคำ'));
+  if(!live.length) return;
+
+  const cryptoAssets = live.filter(a=>a.category==='คริปโต' && a.cryptoSymbol);
+  if(cryptoAssets.length){
+    const ids = [...new Set(cryptoAssets.map(a=>a.cryptoSymbol))].join(',');
+    try{
+      const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${ids}&vs_currencies=thb`);
+      const data = await res.json();
+      for(const a of cryptoAssets){
+        const price = data && data[a.cryptoSymbol] && data[a.cryptoSymbol].thb;
+        if(price) await db.collection('assets').doc(a.id).update({currentPrice: price});
+      }
+    } catch(e){ /* silent fail, keep last known price */ }
+  }
+
+  const goldAssets = live.filter(a=>a.category==='ทองคำ');
+  if(goldAssets.length){
+    try{
+      const res = await fetch('https://api.chnwt.dev/thai-gold-api/latest.json');
+      const data = await res.json();
+      const priceStr = data && data.response && data.response.price && data.response.price.gold_bar && data.response.price.gold_bar.sell;
+      const price = priceStr ? parseFloat(String(priceStr).replace(/,/g,'')) : null;
+      if(price){
+        for(const a of goldAssets){ await db.collection('assets').doc(a.id).update({currentPrice: price}); }
+      }
+    } catch(e){ /* silent fail, keep last known price */ }
+  }
+}
 function openAssetSheet(id){
   editingAssetId = id || null;
   asFileData = null;
@@ -1505,6 +1544,7 @@ function openAssetSheet(id){
     if(asType==='investment'){
       document.getElementById('asInvName').value = a.name;
       document.getElementById('asInvCategory').value = a.category;
+      if(a.category==='คริปโต' && a.cryptoSymbol) document.getElementById('asCryptoSymbol').value = a.cryptoSymbol;
       document.getElementById('asInvDate').value = a.purchaseDate;
       document.getElementById('asQty').value = a.quantity;
       document.getElementById('asCostPerUnit').value = a.costPerUnit;
@@ -1598,7 +1638,8 @@ document.getElementById('asSave').onclick = async ()=>{
     }
   }
   const payload = isInv
-    ? { assetType:'investment', name, category, purchaseDate, quantity, costPerUnit, currentPrice, purchasePrice: price, status, salePrice, imageUrl: imageUrl||null }
+    ? { assetType:'investment', name, category, purchaseDate, quantity, costPerUnit, currentPrice, purchasePrice: price, status, salePrice, imageUrl: imageUrl||null,
+        cryptoSymbol: category==='คริปโต' ? document.getElementById('asCryptoSymbol').value : null }
     : { assetType:'physical', name, category, purchaseDate, purchasePrice:price, usefulLifeYears, method, status, salePrice, imageUrl: imageUrl||null };
 
   if(editingAssetId){
